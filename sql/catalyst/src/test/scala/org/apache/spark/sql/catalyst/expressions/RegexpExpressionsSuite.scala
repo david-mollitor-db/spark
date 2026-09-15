@@ -400,10 +400,10 @@ class RegexpExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
   test("SPARK-22570: RegExpReplace should not create a lot of global variables") {
     val ctx = new CodegenContext
     RegExpReplace(Literal("100"), Literal("(\\d+)"), Literal("num")).genCode(ctx)
-    // four global variables (lastRegex, pattern, lastReplacement, and lastReplacementInUTF8)
-    // are always required, which are allocated in type-based global array
+    // five global variables (lastRegex, pattern, matcher, lastReplacement, and
+    // lastReplacementInUTF8) are always required, which are allocated in type-based global array
     assert(ctx.inlinedMutableStates.length == 0)
-    assert(ctx.mutableStateInitCode.length == 4)
+    assert(ctx.mutableStateInitCode.length == 5)
   }
 
   test("RegexExtract") {
