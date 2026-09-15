@@ -746,6 +746,8 @@ case class RegExpReplace(subject: Expression, regexp: Expression, rep: Expressio
   @transient private var lastRegex: UTF8String = _
   // last regex pattern, we cache it for performance concern
   @transient private var pattern: Pattern = _
+  // reusable matcher for the cached pattern, reset per row to avoid a per-row Matcher allocation.
+  @transient private var matcher: Matcher = _
   // last replacement string, we don't want to convert a UTF8String => java.langString every time.
   @transient private var lastReplacement: String = _
   @transient private var lastReplacementInUTF8: UTF8String = _
@@ -756,6 +758,7 @@ case class RegExpReplace(subject: Expression, regexp: Expression, rep: Expressio
     if (!p.equals(lastRegex)) {
       val patternAndRegex = RegExpUtils.getPatternAndLastRegex(p, prettyName, collationId)
       pattern = patternAndRegex._1
+      matcher = pattern.matcher("")
       lastRegex = patternAndRegex._2
     }
     if (!r.equals(lastReplacementInUTF8)) {
@@ -763,7 +766,7 @@ case class RegExpReplace(subject: Expression, regexp: Expression, rep: Expressio
       lastReplacementInUTF8 = r.asInstanceOf[UTF8String].clone()
       lastReplacement = lastReplacementInUTF8.toString
     }
-    RegExpUtils.replace(pattern, s.toString, lastReplacement, i.asInstanceOf[Int])
+    RegExpUtils.replace(matcher, s.toString, lastReplacement, i.asInstanceOf[Int])
   }
 
   override def dataType: DataType =
@@ -786,8 +789,8 @@ case class RegExpReplace(subject: Expression, regexp: Expression, rep: Expressio
     val regExpUtils = RegExpUtils.getClass.getName.stripSuffix("$")
 
     nullSafeCodeGen(ctx, ev, (subject, regexp, rep, pos) => {
-      val (patternCode, termPattern) =
-        RegExpUtils.initLastPatternCode(ctx, regexp, prettyName, collationId)
+      val (patternCode, termMatcher) =
+        RegExpUtils.initLastPatternAndMatcherCode(ctx, regexp, prettyName, collationId)
       s"""
         $patternCode
         if (!$rep.equals($termLastReplacementInUTF8)) {
@@ -796,7 +799,7 @@ case class RegExpReplace(subject: Expression, regexp: Expression, rep: Expressio
           $termLastReplacement = $termLastReplacementInUTF8.toString();
         }
         ${ev.value} = $regExpUtils.replace(
-          $termPattern, $subject.toString(), $termLastReplacement, $pos);
+          $termMatcher, $subject.toString(), $termLastReplacement, $pos);
         $setEvNotNull
       """
     })
@@ -868,6 +871,8 @@ abstract class RegExpExtractBase
   @transient private var lastRegex: UTF8String = _
   // last regex pattern, we cache it for performance concern
   @transient private var pattern: Pattern = _
+  // reusable matcher for the cached pattern, reset per row to avoid a per-row Matcher allocation.
+  @transient private var matcher: Matcher = _
   override def stateful: Boolean = true
 
   final override val nodePatterns: Seq[TreePattern] = Seq(REGEXP_EXTRACT_FAMILY)
@@ -885,9 +890,10 @@ abstract class RegExpExtractBase
       // regex value changed
       val patternAndRegex = RegExpUtils.getPatternAndLastRegex(p, prettyName, collationId)
       pattern = patternAndRegex._1
+      matcher = pattern.matcher("")
       lastRegex = patternAndRegex._2
     }
-    pattern.matcher(s.toString)
+    matcher.reset(s.toString)
   }
 }
 
@@ -1246,6 +1252,36 @@ object RegExpUtils {
     (code, termPattern)
   }
 
+  // Like initLastPatternCode, but also caches a Matcher that is rebuilt only when the pattern
+  // changes, so the caller can reset() it per row (see RegExpUtils.replace) instead of allocating
+  // a Matcher per row. Returns (code, matcherTermName).
+  def initLastPatternAndMatcherCode(
+      ctx: CodegenContext,
+      regexp: String,
+      prettyName: String,
+      collationId: Int): (String, String) = {
+    val classNamePattern = classOf[Pattern].getCanonicalName
+    val classNameMatcher = classOf[Matcher].getCanonicalName
+    val termLastRegex = ctx.addMutableState("UTF8String", "lastRegex")
+    val termPattern = ctx.addMutableState(classNamePattern, "pattern")
+    val termMatcher = ctx.addMutableState(classNameMatcher, "matcher")
+    val collationRegexFlags = CollationSupport.collationAwareRegexFlags(collationId)
+    val utils = classOf[ExpressionImplUtils].getName
+
+    val code =
+      s"""
+         |if (!$regexp.equals($termLastRegex)) {
+         |  // regex value changed
+         |  UTF8String r = $regexp.clone();
+         |  $termPattern =
+         |    $utils.compileRegexPattern(r.toString(), $collationRegexFlags, "$prettyName");
+         |  $termMatcher = $termPattern.matcher("");
+         |  $termLastRegex = r;
+         |}
+         |""".stripMargin
+    (code, termMatcher)
+  }
+
   def initLastMatcherCode(
       ctx: CodegenContext,
       subject: String,
@@ -1253,10 +1289,12 @@ object RegExpUtils {
       matcher: String,
       prettyName: String,
       collationId: Int): String = {
-    val (patternCode, termPattern) = initLastPatternCode(ctx, regexp, prettyName, collationId)
+    val (patternCode, termMatcher) =
+      initLastPatternAndMatcherCode(ctx, regexp, prettyName, collationId)
     s"""
        |$patternCode
-       |java.util.regex.Matcher $matcher = $termPattern.matcher($subject.toString());
+       |java.util.regex.Matcher $matcher = $termMatcher;
+       |$matcher.reset($subject.toString());
        |""".stripMargin
   }
 
@@ -1270,19 +1308,20 @@ object RegExpUtils {
 
   /**
    * Runs the regexp_replace loop shared by RegExpReplace's eval and codegen, so the generated
-   * Java is a single call rather than an inline matcher build + match/replace loop + error
-   * construction. The matcher is built here from `pattern`. `source` is returned (as a new
-   * UTF8String) when the start position is out of range; `pos` and `pattern.pattern()` (the
-   * original regex string) are only used to build the error message on a failed replacement.
+   * Java is a single call rather than an inline match/replace loop + error construction. The
+   * caller passes a cached `matcher` (rebuilt only when the pattern changes); it is reset to
+   * `source` here, so no Matcher is allocated per row. `source` is returned (as a new
+   * UTF8String) when the start position is out of range; `pos` and `matcher.pattern().pattern()`
+   * (the original regex string) are only used to build the error message on a failed replacement.
    */
   def replace(
-      pattern: Pattern,
+      matcher: Matcher,
       source: String,
       replacement: String,
       pos: Int): UTF8String = {
     val position = pos - 1
     if (position == 0 || position < source.codePointCount(0, source.length)) {
-      val matcher = pattern.matcher(source)
+      matcher.reset(source)
       matcher.region(source.offsetByCodePoints(0, position), source.length)
       val result = new JStringBuilder
       while (matcher.find()) {
@@ -1290,11 +1329,11 @@ object RegExpUtils {
           matcher.appendReplacement(result, replacement)
         } catch {
           case NonFatal(e) =>
-            // pattern.pattern() is the original regexp string: the pattern is compiled from the
+            // matcher.pattern().pattern() is the original regexp string: it is compiled from the
             // raw regexp without escaping (see ExpressionImplUtils.compileRegexPattern), so it
             // round-trips exactly into the error message.
             throw QueryExecutionErrors.invalidRegexpReplaceError(
-              source, pattern.pattern(), replacement, pos, e)
+              source, matcher.pattern().pattern(), replacement, pos, e)
         }
       }
       matcher.appendTail(result)

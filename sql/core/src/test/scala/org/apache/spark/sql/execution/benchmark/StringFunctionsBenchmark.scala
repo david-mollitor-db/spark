@@ -46,13 +46,23 @@ object StringFunctionsBenchmark extends SqlBasedBenchmark {
     df.selectExpr("regexp_replace(subject, regexp, rep)").noop()
   }
 
+  private def doRegexpExtractBenchmark(): Unit = {
+    df.selectExpr("regexp_extract(subject, regexp, 1)").noop()
+  }
+
   override def runBenchmarkSuite(mainArgs: Array[String]): Unit = {
     runBenchmark("SQL string functions") {
-      val benchmark = new Benchmark("regexp_replace", N, output = output)
-      benchmark.addCase("""regexp_replace('*-*', '(\\d+)', 'num')""", M) { _ =>
+      val replaceBenchmark = new Benchmark("regexp_replace", N, output = output)
+      replaceBenchmark.addCase("""regexp_replace('*-*', '(\\d+)', 'num')""", M) { _ =>
         doRegexpReplaceBenchmark()
       }
-      benchmark.run()
+      replaceBenchmark.run()
+
+      val extractBenchmark = new Benchmark("regexp_extract", N, output = output)
+      extractBenchmark.addCase("""regexp_extract('*-*', '(\\d+)', 1)""", M) { _ =>
+        doRegexpExtractBenchmark()
+      }
+      extractBenchmark.run()
     }
   }
 }
