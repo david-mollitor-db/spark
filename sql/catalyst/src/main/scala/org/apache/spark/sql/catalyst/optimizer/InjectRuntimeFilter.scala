@@ -271,7 +271,7 @@ object InjectRuntimeFilter extends Rule[LogicalPlan] with PredicateHelper with J
   }
 
   // Returns the max scan byte size in the subtree rooted at `filterApplicationSide`.
-  private def maxScanByteSize(filterApplicationSide: LogicalPlan): BigInt = {
+  private[optimizer] def maxScanByteSize(filterApplicationSide: LogicalPlan): BigInt = {
     val defaultSizeInBytes = conf.getConf(SQLConf.DEFAULT_SIZE_IN_BYTES)
     filterApplicationSide.collect({
       case leaf: LeafNode => leaf

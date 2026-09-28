@@ -74,6 +74,8 @@ class SparkOptimizer(
       new RowLevelOperationRuntimeGroupFiltering(OptimizeSubqueries)),
     Batch("InjectRuntimeFilter", FixedPoint(1),
       InjectRuntimeFilter),
+    Batch("InjectDynamicMinMaxFilter", FixedPoint(1),
+      InjectDynamicMinMaxFilter),
     Batch("MergeSubplans", Once,
       MergeSubplans,
       CombineApproximatePercentiles,

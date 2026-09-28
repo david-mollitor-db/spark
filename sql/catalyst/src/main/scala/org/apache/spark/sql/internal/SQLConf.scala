@@ -904,6 +904,44 @@ object SQLConf {
       .booleanConf
       .createWithDefault(true)
 
+  val DYNAMIC_MINMAX_FILTER_ENABLED =
+    buildConf("spark.sql.optimizer.dynamicMinMaxFilter.enabled")
+      .internal()
+      .doc("When true, for an equi-join that also carries a one-sided inequality between a " +
+        "column on each side (e.g. `t1.a < t2.b`), inject a derived min/max filter " +
+        "(e.g. `t1.a < MAX(t2.b)`) computed at runtime on the constrained side, to prune " +
+        "rows before the join has to buffer them. The result is unchanged: the derived " +
+        "predicate is a necessary condition of the inequality.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(true)
+
+  val DYNAMIC_MINMAX_FILTER_APPLICATION_SIDE_SCAN_SIZE_THRESHOLD =
+    buildConf("spark.sql.optimizer.dynamicMinMaxFilter.applicationSideScanSizeThreshold")
+      .internal()
+      .doc("Byte size threshold of the largest scan on the side a dynamic min/max filter is " +
+        "applied to. The filter is only injected when that scan is at least this large. Lower " +
+        "than the bloom filter's threshold because a min/max filter is a single scalar " +
+        "comparison that is cheap to evaluate and can be pushed down to the scan.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .bytesConf(ByteUnit.BYTE)
+      .createWithDefaultString("256MB")
+
+  val DYNAMIC_MINMAX_FILTER_MIN_ESTIMATED_PRUNE_RATIO =
+    buildConf("spark.sql.optimizer.dynamicMinMaxFilter.minEstimatedPruneRatio")
+      .internal()
+      .doc("When column statistics are available for both sides, a dynamic min/max filter is " +
+        "only injected if the estimated fraction of rows it prunes from the application side " +
+        "is at least this ratio. Without statistics the filter is injected, subject to the " +
+        "size thresholds.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .doubleConf
+      .checkValue(r => r >= 0.0 && r <= 1.0, "The ratio must be in [0, 1].")
+      .createWithDefault(0.1)
+
   val RUNTIME_BLOOM_FILTER_CREATION_SIDE_THRESHOLD =
     buildConf("spark.sql.optimizer.runtime.bloomFilter.creationSideThreshold")
       .doc("Size threshold of the bloom filter creation side plan. Estimated size needs to be " +
