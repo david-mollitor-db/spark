@@ -20,6 +20,7 @@ package org.apache.spark.sql.execution.datasources.parquet
 import java.io.File
 import java.lang.{Double => JDouble, Float => JFloat, Long => JLong}
 import java.math.{BigDecimal => JBigDecimal}
+import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.sql.{Date, Timestamp}
 import java.time.{Duration, Instant, LocalDate, LocalDateTime, LocalTime, Period, ZoneId}
@@ -37,13 +38,14 @@ import org.apache.parquet.filter2.predicate.Operators.{Column => _, Eq, Gt, GtEq
 import org.apache.parquet.hadoop.{ParquetFileReader, ParquetInputFormat, ParquetOutputFormat}
 import org.apache.parquet.hadoop.example.ExampleParquetWriter
 import org.apache.parquet.hadoop.util.HadoopInputFile
+import org.apache.parquet.io.api.Binary
 import org.apache.parquet.schema.{MessageType, MessageTypeParser}
 
 import org.apache.spark.{SparkConf, SparkException, SparkRuntimeException}
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.optimizer.InferFiltersFromConstraints
+import org.apache.spark.sql.catalyst.optimizer.{BooleanSimplification, InferFiltersFromConstraints}
 import org.apache.spark.sql.catalyst.planning.PhysicalOperation
 import org.apache.spark.sql.catalyst.util.RebaseDateTime.RebaseSpec
 import org.apache.spark.sql.connector.catalog.CatalogV2Implicits.parseColumnPath
@@ -1779,6 +1781,171 @@ abstract class ParquetFilterSuite extends ParquetTest with SharedSparkSession {
         filter,
         shouldFilterOut,
         enableDictionary = false)
+    }
+  }
+
+  test("filter pushdown - OR of StringContains on one column becomes one predicate") {
+    import ParquetFilters.StringContainsAnyPredicate
+    val schema = new SparkToParquetSchemaConverter(conf).convert(
+      StructType.fromDDL("a STRING, b STRING, Name STRING, i INT"))
+    val parquetFilters = createParquetFilters(schema)
+
+    def contains(column: String, needle: String): sources.Filter =
+      sources.StringContains(column, needle)
+    def or(filters: sources.Filter*): sources.Filter = filters.reduceLeft(sources.Or)
+    def containsAny(column: String, needles: String*): FilterPredicate =
+      FilterApi.userDefined(binaryColumn(column), StringContainsAnyPredicate(needles))
+    def userDefinedPredicates(predicate: FilterPredicate): Seq[AnyRef] = predicate match {
+      case or: Operators.Or =>
+        userDefinedPredicates(or.getLeft) ++ userDefinedPredicates(or.getRight)
+      case udp: UserDefinedByInstance[_, _] => Seq(udp.getUserDefinedPredicate)
+      case _ => Nil
+    }
+
+    // Needles are deduplicated and kept in order of first appearance, however the ORs nest.
+    assertResult(Some(containsAny("a", "x", "y"))) {
+      parquetFilters.createFilter(or(contains("a", "x"), contains("a", "y")))
+    }
+    assertResult(Some(containsAny("a", "x", "y", "z"))) {
+      parquetFilters.createFilter(sources.Or(
+        contains("a", "x"),
+        sources.Or(sources.Or(contains("a", "y"), contains("a", "x")), contains("a", "z"))))
+    }
+    // U+00E9 as UTF-8, built from bytes to keep this file ASCII.
+    val eAcute = new String(Array(0xC3, 0xA9).map(_.toByte), StandardCharsets.UTF_8)
+    assertResult(Some(containsAny("a", "", eAcute))) {
+      parquetFilters.createFilter(or(contains("a", ""), contains("a", eAcute)))
+    }
+
+    // Other disjuncts stay next to the fused predicate, and each column is fused separately.
+    assertResult(Some(FilterApi.or(containsAny("a", "x", "y"), gt(intColumn("i"), Int.box(3))))) {
+      parquetFilters.createFilter(
+        or(contains("a", "x"), sources.GreaterThan("i", 3), contains("a", "y")))
+    }
+    assertResult(Some(FilterApi.or(containsAny("a", "x", "y"), containsAny("b", "u", "v")))) {
+      parquetFilters.createFilter(
+        or(contains("a", "x"), contains("b", "u"), contains("a", "y"), contains("b", "v")))
+    }
+
+    // Fusion applies under AND and NOT too.
+    assertResult(Some(FilterApi.and(gt(intColumn("i"), Int.box(3)), containsAny("a", "x", "y")))) {
+      parquetFilters.createFilter(
+        sources.And(sources.GreaterThan("i", 3), or(contains("a", "x"), contains("a", "y"))))
+    }
+    assertResult(Some(FilterApi.not(containsAny("a", "x", "y")))) {
+      parquetFilters.createFilter(sources.Not(or(contains("a", "x"), contains("a", "y"))))
+    }
+
+    // Column names resolve case-insensitively when the analysis is case-insensitive.
+    assertResult(Some(containsAny("Name", "x", "y"))) {
+      createParquetFilters(schema, caseSensitive = Some(false))
+        .createFilter(or(contains("name", "x"), contains("NAME", "y")))
+    }
+
+    // One needle per column is pushed as before.
+    Seq(
+      or(contains("a", "x"), contains("b", "y")),
+      or(contains("a", "x"), contains("a", "x"))
+    ).foreach { filter =>
+      val pushed = parquetFilters.createFilter(filter)
+      assert(pushed.exists(_.isInstanceOf[Operators.Or]), filter)
+      val udps = userDefinedPredicates(pushed.get)
+      assert(udps.size == 2 && !udps.exists(_.isInstanceOf[StringContainsAnyPredicate]), filter)
+    }
+
+    // A disjunct that cannot be pushed down still keeps the whole OR from being pushed.
+    assertResult(None) {
+      parquetFilters.createFilter(or(contains("a", "x"), contains("a", "y"), contains("a", null)))
+    }
+    assertResult(None) {
+      parquetFilters.createFilter(
+        or(contains("a", "x"), contains("a", "y"), contains("missing", "z")))
+    }
+    withSQLConf(SQLConf.PARQUET_FILTER_PUSHDOWN_STRING_PREDICATE_ENABLED.key -> "false") {
+      assertResult(None) {
+        createParquetFilters(schema).createFilter(or(contains("a", "x"), contains("a", "y")))
+      }
+    }
+  }
+
+  test("filter pushdown - StringContainsAnyPredicate") {
+    import ParquetFilters.StringContainsAnyPredicate
+    val predicate = StringContainsAnyPredicate(Seq("ab", "xyz"))
+    assert(!predicate.keep(null))
+    assert(!predicate.acceptsNullValue())
+    assert(predicate.keep(Binary.fromString("--ab--")))
+    assert(predicate.keep(Binary.fromString("xyz")))
+    assert(!predicate.keep(Binary.fromString("a-b-xy-z")))
+
+    // Values that are slices of a larger array, like dictionary entries, and off-heap values.
+    val bytes = "abxyz".getBytes(StandardCharsets.UTF_8)
+    assert(!predicate.keep(Binary.fromConstantByteArray(bytes, 1, 3)))
+    assert(predicate.keep(Binary.fromConstantByteArray(bytes, 2, 3)))
+    val direct = ByteBuffer.allocateDirect(bytes.length)
+    direct.put(bytes).flip()
+    assert(!predicate.keep(Binary.fromConstantByteBuffer(direct, 1, 3)))
+    assert(predicate.keep(Binary.fromConstantByteBuffer(direct, 2, 3)))
+
+    // Parquet Java-serializes the predicate; the matcher is rebuilt after deserialization.
+    val copy = Utils.deserialize[StringContainsAnyPredicate](Utils.serialize(predicate))
+    assert(copy === predicate)
+    assert(copy.keep(Binary.fromString("--xyz")))
+    assert(!copy.keep(Binary.fromString("--xy")))
+
+    // Parquet logs the predicate for every file, so its string form stays short.
+    assertResult("StringContainsAny(1000 needles: 1, 2, 3, ...)") {
+      StringContainsAnyPredicate((1 to 1000).map(_.toString)).toString
+    }
+  }
+
+  test("filter pushdown - OR of StringContains") {
+    withParquetDataFrame((1 to 4).map(i => Tuple1(s"${i}str$i"))) { implicit df =>
+      checkFilterPredicate(
+        ($"_1".contains("1s") || $"_1".contains("r3")).asInstanceOf[Predicate],
+        classOf[UserDefinedByInstance[_, _]],
+        Seq(Row("1str1"), Row("3str3")))
+      checkFilterPredicate(
+        ($"_1".contains("x") || $"_1".contains("") || $"_1".contains("y")).asInstanceOf[Predicate],
+        classOf[UserDefinedByInstance[_, _]],
+        Seq("1str1", "2str2", "3str3", "4str4").map(Row(_)))
+      checkFilterPredicate(
+        ($"_1".contains("x") || $"_1".contains("y")).asInstanceOf[Predicate],
+        classOf[UserDefinedByInstance[_, _]],
+        Seq.empty[Row])
+    }
+
+    withParquetDataFrame(Seq(Tuple1[String](null), Tuple1("ab"))) { implicit df =>
+      checkFilterPredicate(
+        ($"_1".contains("a") || $"_1".contains("x")).asInstanceOf[Predicate],
+        classOf[UserDefinedByInstance[_, _]],
+        Seq(Row("ab")))
+    }
+  }
+
+  test("filter pushdown - OR of StringContains skips row groups by dictionary") {
+    import testImplicits._
+    // The dictionary holds the ten digits.
+    val digits = spark.range(1000).map(t => (t % 10).toString).toDF()
+    testStringPredicate(digits, "value like '%a%' or value like '%b%'", true)
+    testStringPredicate(digits, "value like any ('%a%', '%b%', '%c%')", true)
+    testStringPredicate(digits, "value like '%a%' or value like '%7%'", false)
+
+    // Keep the NOT of the OR as it is instead of turning it into an AND of NOTs. Every value
+    // contains one of the needles, but no needle is in every value, so only the fused predicate
+    // can tell that no row satisfies the NOT.
+    withSQLConf(SQLConf.OPTIMIZER_EXCLUDED_RULES.key -> BooleanSimplification.ruleName) {
+      val notEither = "not (value like '%a%' or value like '%b%')"
+      testStringPredicate(
+        spark.range(1000).map(t => if (t % 2 == 0) "xa" else "yb").toDF(), notEither, true)
+
+      val withNeither = spark.range(999).map(t => Seq("xa", "yb", "zz")((t % 3).toInt)).toDF()
+      testStringPredicate(withNeither, notEither, false)
+      withTempPath { dir =>
+        withNeither.write.parquet(dir.getCanonicalPath)
+        checkAnswer(
+          spark.read.parquet(dir.getCanonicalPath).where(notEither),
+          Seq.fill(333)(Row("zz")))
+      }
     }
   }
 

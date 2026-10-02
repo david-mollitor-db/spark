@@ -83,14 +83,18 @@ object FilterPushdownBenchmark extends SqlBasedBenchmark {
   }
 
   private def prepareStringDictTable(
-      dir: File, numRows: Int, numDistinctValues: Int, width: Int): Unit = {
+      dir: File,
+      numRows: Int,
+      numDistinctValues: Int,
+      width: Int,
+      sorted: Boolean = true): Unit = {
     val selectExpr = (0 to width).map {
       case 0 => s"CAST(id % $numDistinctValues AS STRING) AS value"
       case i => s"CAST(rand() AS STRING) c$i"
     }
-    val df = spark.range(numRows).selectExpr(selectExpr: _*).sort("value")
+    val df = spark.range(numRows).selectExpr(selectExpr: _*)
 
-    saveAsTable(df, dir, true)
+    saveAsTable(if (sorted) df.sort("value") else df, dir, true)
   }
 
   private def saveAsTable(df: DataFrame, dir: File, useDictionary: Boolean = false): Unit = {
@@ -270,6 +274,21 @@ object FilterPushdownBenchmark extends SqlBasedBenchmark {
           ).foreach { whereExpr =>
             val title = s"StringContains filter: ($whereExpr)"
             filterPushDownBenchmark(numRows, title, whereExpr)
+          }
+        }
+      }
+    }
+
+    runBenchmark("Pushdown benchmark for multiple StringContains") {
+      withTempPath { dir =>
+        withTempTable("orcTable", "parquetTable") {
+          // Unsorted, so that the dictionary of every row group holds many distinct values.
+          prepareStringDictTable(dir, numRows, 50000, width, sorted = false)
+          Seq(2, 16, 64).foreach { numNeedles =>
+            // The values are digits, so no needle occurs and every row group can be skipped.
+            val needles = (1 to numNeedles).map(i => s"'%x$i%'").mkString(", ")
+            val title = s"StringContains filter: (value like any of $numNeedles absent needles)"
+            filterPushDownBenchmark(numRows, title, s"value LIKE ANY ($needles)")
           }
         }
       }

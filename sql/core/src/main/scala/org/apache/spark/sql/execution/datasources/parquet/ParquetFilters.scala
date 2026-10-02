@@ -26,6 +26,7 @@ import java.time.temporal.ChronoField.MICRO_OF_DAY
 import java.util.HashSet
 import java.util.Locale
 
+import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 
 import org.apache.parquet.filter2.predicate._
@@ -46,6 +47,8 @@ import org.apache.spark.sql.execution.datasources.parquet.types.ops.{ParquetFilt
 import org.apache.spark.sql.internal.LegacyBehaviorPolicy
 import org.apache.spark.sql.sources
 import org.apache.spark.sql.types._
+import org.apache.spark.unsafe.Platform
+import org.apache.spark.unsafe.array.MultiSubstringMatcher
 import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.ArrayImplicits._
 
@@ -1050,11 +1053,14 @@ class ParquetFilters(
    * @param canPartialPushDownConjuncts whether a subset of conjuncts of predicates can be pushed
    *                                    down safely. Pushing ONLY one side of AND down is safe to
    *                                    do at the top level or none of its ancestors is NOT and OR.
+   * @param tryFuse whether an OR may be converted by `createOrFilter`. False once
+   *                `createOrFilter` has found nothing to fuse in the OR or in an enclosing OR.
    * @return the Parquet-native filter predicates that are eligible for pushdown.
    */
   private def createFilterHelper(
       predicate: sources.Filter,
-      canPartialPushDownConjuncts: Boolean): Option[FilterPredicate] = {
+      canPartialPushDownConjuncts: Boolean,
+      tryFuse: Boolean = true): Option[FilterPredicate] = {
     // NOTE:
     //
     // For any comparison operator `cmp`, both `a cmp NULL` and `NULL cmp a` evaluate to `NULL`,
@@ -1162,6 +1168,9 @@ class ParquetFilters(
           case _ => None
         }
 
+      case or: sources.Or if tryFuse =>
+        createOrFilter(or, canPartialPushDownConjuncts)
+
       case sources.Or(lhs, rhs) =>
         // The Or predicate is convertible when both of its children can be pushed down.
         // That is to say, if one/both of the children can be partially pushed down, the Or
@@ -1175,8 +1184,8 @@ class ParquetFilters(
         // (a1 OR b1) AND (a1 OR b2) AND (a2 OR b1) AND (a2 OR b2)
         // As per the logical in And predicate, we can push down (a1 OR b1).
         for {
-          lhsFilter <- createFilterHelper(lhs, canPartialPushDownConjuncts)
-          rhsFilter <- createFilterHelper(rhs, canPartialPushDownConjuncts)
+          lhsFilter <- createFilterHelper(lhs, canPartialPushDownConjuncts, tryFuse = false)
+          rhsFilter <- createFilterHelper(rhs, canPartialPushDownConjuncts, tryFuse = false)
         } yield FilterApi.or(lhsFilter, rhsFilter)
 
       // Refuse to push a negated predicate that references a shredded-variant path: not() of the
@@ -1277,6 +1286,120 @@ class ParquetFilters(
         }
 
       case _ => None
+    }
+  }
+
+  /**
+   * Converts an OR, pushing two or more StringContains on the same column down as a single
+   * predicate. Parquet then checks all of the column's needles in one pass over each value, in
+   * particular over each dictionary entry, instead of one pass per needle. An OR without such a
+   * column is converted as usual.
+   */
+  private def createOrFilter(
+      or: sources.Or,
+      canPartialPushDownConjuncts: Boolean): Option[FilterPredicate] = {
+    val disjuncts = mutable.ArrayBuffer.empty[sources.Filter]
+    collectDisjuncts(or, disjuncts)
+
+    // The column and needle of a StringContains that could be pushed down on its own.
+    def columnAndNeedle(filter: sources.Filter): Option[(Seq[String], String)] = filter match {
+      case sources.StringContains(name, value)
+          if pushDownStringPredicate && value != null && canMakeFilterOn(name, value) =>
+        Some((nameToParquetField(name).fieldNames.toImmutableArraySeq, value))
+      case _ => None
+    }
+
+    val needlesByColumn = mutable.LinkedHashMap.empty[Seq[String], mutable.LinkedHashSet[String]]
+    disjuncts.flatMap(columnAndNeedle).foreach { case (column, needle) =>
+      needlesByColumn.getOrElseUpdate(column, mutable.LinkedHashSet.empty) += needle
+    }
+    val fusedColumns = needlesByColumn.filter { case (_, needles) =>
+      needles.size >= 2 && MultiSubstringMatcher.estimateTableBytes(
+        needles.iterator.map(_.getBytes(UTF_8)).toArray) <= ParquetFilters.MAX_FUSED_TABLE_BYTES
+    }
+
+    if (fusedColumns.isEmpty) {
+      createFilterHelper(or, canPartialPushDownConjuncts, tryFuse = false)
+    } else {
+      val fused = fusedColumns.map { case (column, needles) =>
+        Some(FilterApi.userDefined(binaryColumn(column.toArray),
+          ParquetFilters.StringContainsAnyPredicate(needles.toSeq)))
+      }
+      def isFused(filter: sources.Filter): Boolean =
+        columnAndNeedle(filter).exists { case (column, _) => fusedColumns.contains(column) }
+      val others =
+        disjuncts.filterNot(isFused).map(createFilterHelper(_, canPartialPushDownConjuncts))
+      val converted: IndexedSeq[Option[FilterPredicate]] = (fused ++ others).toIndexedSeq
+      if (converted.forall(_.isDefined)) Some(balancedOr(converted.flatten)) else None
+    }
+  }
+
+  // Appends the operands of nested ORs, left to right.
+  private def collectDisjuncts(
+      filter: sources.Filter,
+      disjuncts: mutable.Buffer[sources.Filter]): Unit = filter match {
+    case sources.Or(lhs, rhs) =>
+      collectDisjuncts(lhs, disjuncts)
+      collectDisjuncts(rhs, disjuncts)
+    case other =>
+      disjuncts += other
+  }
+
+  // ORs the filters as a balanced tree, keeping the depth logarithmic: parquet's filter visitors
+  // and the Java serialization of the predicate both recurse through it.
+  private def balancedOr(filters: IndexedSeq[FilterPredicate]): FilterPredicate = {
+    if (filters.length == 1) {
+      filters.head
+    } else {
+      val (left, right) = filters.splitAt(filters.length / 2)
+      FilterApi.or(balancedOr(left), balancedOr(right))
+    }
+  }
+}
+
+object ParquetFilters {
+
+  // Needles whose matcher table would take more memory than this are not fused.
+  private[parquet] val MAX_FUSED_TABLE_BYTES: Long = 64L * 1024 * 1024
+
+  /**
+   * Keeps the values that contain any of `needles`. It is pushed down in place of an OR of
+   * StringContains on one column, so that Parquet checks all of the needles in one pass over
+   * each value.
+   */
+  private[parquet] case class StringContainsAnyPredicate(needles: Seq[String])
+    extends UserDefinedPredicate[Binary] {
+
+    // Built on first use. The predicate is Java-serialized into the Hadoop conf and deserialized
+    // again for each file, and only the dictionary and record-level filters call `keep`.
+    @transient private lazy val matcher =
+      new MultiSubstringMatcher(needles.map(_.getBytes(UTF_8)).toArray)
+
+    override def canDrop(statistics: Statistics[Binary]): Boolean = false
+
+    override def inverseCanDrop(statistics: Statistics[Binary]): Boolean = false
+
+    override def keep(value: Binary): Boolean = {
+      if (value == null) {
+        false
+      } else {
+        // Match the bytes in place when they are on the heap, as dictionary entries are.
+        val buffer = value.toByteBuffer()
+        if (buffer.hasArray()) {
+          matcher.matches(buffer.array(),
+            Platform.BYTE_ARRAY_OFFSET + buffer.arrayOffset() + buffer.position(),
+            buffer.remaining())
+        } else {
+          val bytes = value.getBytesUnsafe
+          matcher.matches(bytes, Platform.BYTE_ARRAY_OFFSET, bytes.length)
+        }
+      }
+    }
+
+    // Parquet logs this and stores it in the Hadoop conf for every file, so keep it short.
+    override def toString: String = {
+      val more = if (needles.length > 3) ", ..." else ""
+      s"StringContainsAny(${needles.length} needles: ${needles.take(3).mkString(", ")}$more)"
     }
   }
 }
