@@ -23,6 +23,7 @@ import org.apache.spark.sql.catalyst.util.CollationSupport;
 import org.junit.jupiter.api.Test;
 
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -1334,6 +1335,43 @@ public class CollationSupportSuite {
       assertLower("𐐭𝔸", collationName, "𐐭𝔸");
       // Ligatures.
       assertLower("ß ﬁ ﬃ ﬀ ﬆ ῗ", collationName,"ß ﬁ ﬃ ﬀ ﬆ ῗ");
+      // Non-ASCII code points that do not change when lowercased (U+2A2F VECTOR OR CROSS
+      // PRODUCT, U+00B5 MICRO SIGN, CJK), mixed with ASCII letters that do.
+      assertLower("\u2A2F AbC", collationName, "\u2A2F abc");
+      assertLower("12 \u00B5S", collationName, "12 \u00B5s");
+      assertLower("列表 ABC", collationName, "列表 abc");
+      // Non-ASCII code points that do change: a letter, and cased non-letters (U+2160 ROMAN
+      // NUMERAL ONE, U+24B6 CIRCLED LATIN CAPITAL LETTER A).
+      assertLower("\u2A2F Ä", collationName, "\u2A2F ä");
+      assertLower("\u2160 \u24B6 \u2A2F", collationName, "\u2170 \u24D0 \u2A2F");
+    }
+  }
+
+  @Test
+  public void testLowerWithUnchangedNonAscii() {
+    // A string with nothing to lowercase is returned as is.
+    UTF8String noUppercase = UTF8String.fromString("\u2A2F abc \u00B5s 列表");
+    assertSame(noUppercase, CollationSupport.Lower.execBinaryICU(noUppercase));
+    assertSame(noUppercase, CollationSupport.Lower.execLowercase(noUppercase));
+    // Invalid UTF-8 is replaced with U+FFFD, as in the general ICU path.
+    assertEquals(UTF8String.fromString("a\uFFFD\u2A2Fb"),
+      CollationSupport.Lower.execBinaryICU(UTF8String.fromBytes(new byte[] {
+        'A', (byte) 0xFF, (byte) 0xE2, (byte) 0xA8, (byte) 0xAF, 'B'})));
+    assertEquals(UTF8String.fromString("\u2A2Fa\uFFFD"),
+      CollationSupport.Lower.execBinaryICU(UTF8String.fromBytes(new byte[] {
+        (byte) 0xE2, (byte) 0xA8, (byte) 0xAF, 'A', (byte) 0xC3})));
+    // The general ICU path lowercases with the default locale, and Turkic and Lithuanian
+    // locales lowercase ASCII letters differently, so results must not change under them.
+    Locale defaultLocale = Locale.getDefault();
+    try {
+      Locale.setDefault(Locale.forLanguageTag("tr"));
+      assertEquals(UTF8String.fromString("\u0131\u2A2F"),
+        CollationSupport.Lower.execBinaryICU(UTF8String.fromString("I\u2A2F")));
+      Locale.setDefault(Locale.forLanguageTag("lt"));
+      assertEquals(UTF8String.fromString("i\u0307\u0300\u2A2F"),
+        CollationSupport.Lower.execBinaryICU(UTF8String.fromString("I\u0300\u2A2F")));
+    } finally {
+      Locale.setDefault(defaultLocale);
     }
   }
 

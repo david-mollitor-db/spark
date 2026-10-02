@@ -36,6 +36,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -433,7 +434,61 @@ public class CollationAwareUTF8String {
    */
   public static UTF8String toLowerCase(final UTF8String target) {
     if (target.isFullAscii()) return target.toLowerCaseAscii();
+    UTF8String lowercase = toLowerCaseIfOnlyAsciiChanges(target);
+    if (lowercase != null) return lowercase;
     return toLowerCaseSlow(target);
+  }
+
+  /**
+   * Fast path for lowercasing a valid, non-ASCII string in which no non-ASCII code point changes
+   * when lowercased, e.g. symbols (U+2A2F), uncased scripts (CJK), or letters that are already
+   * lowercase (U+00B5). The lowercase of such a string is the string with only its ASCII letters
+   * folded, which can be computed on the UTF-8 bytes without decoding to a Java String.
+   *
+   * The result must equal what `toLowerCaseSlow` returns, so the fast path does not apply when:
+   * - the string is invalid UTF-8, because the slow path replaces invalid sequences with U+FFFD;
+   * - the JVM default locale lowercases differently from the root locale (see
+   *   `isRootLowercaseLocale`), because the slow path lowercases with the default locale.
+   * In the root locale, the full lowercase mapping of a code point differs from its simple
+   * mapping only for U+0130 (one-to-many) and U+03A3 (final sigma, context-dependent), and both
+   * change under the simple mapping checked here.
+   *
+   * @return the lowercase string, or null if the fast path does not apply
+   */
+  private static UTF8String toLowerCaseIfOnlyAsciiChanges(final UTF8String target) {
+    if (!isRootLowercaseLocale(Locale.getDefault()) || !target.isValid()) return null;
+    final int numBytes = target.numBytes();
+    boolean hasUppercaseAscii = false;
+    for (int i = 0; i < numBytes; ) {
+      byte b = target.getByte(i);
+      if (b >= 0) {
+        hasUppercaseAscii |= b >= 'A' && b <= 'Z';
+        i++;
+      } else {
+        int codePoint = target.codePointFrom(i);
+        if (UCharacter.toLowerCase(codePoint) != codePoint) return null;
+        i += UTF8String.numBytesForFirstByte(b);
+      }
+    }
+    if (!hasUppercaseAscii) return target;
+    byte[] bytes = new byte[numBytes];
+    for (int i = 0; i < numBytes; i++) {
+      byte b = target.getByte(i);
+      bytes[i] = (b >= 'A' && b <= 'Z') ? (byte) (b + 32) : b;
+    }
+    return UTF8String.fromBytes(bytes);
+  }
+
+  /**
+   * Returns whether `locale` lowercases like the ICU root locale. This mirrors ICU's case locale
+   * selection: only the Turkic (tr, az) and Lithuanian (lt) case locales have lowercase mappings
+   * that differ from the root locale, e.g. "I" lowercases to dotless U+0131 in Turkish.
+   */
+  private static boolean isRootLowercaseLocale(final Locale locale) {
+    return switch (locale.getLanguage()) {
+      case "tr", "tur", "az", "aze", "lt", "lit" -> false;
+      default -> true;
+    };
   }
 
   private static UTF8String toLowerCaseSlow(final UTF8String target) {
